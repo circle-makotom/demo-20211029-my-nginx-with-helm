@@ -1,0 +1,4 @@
+apiVersion: v2
+name: my-nginx
+description: "My custom nginx"
+version: "0.0.1"

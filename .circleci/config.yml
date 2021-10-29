@@ -1,0 +1,173 @@
+version: 2.1
+
+setup: << pipeline.parameters.is-setup >>
+
+orbs:
+  aws-cli: circleci/aws-cli@2.0.3
+  aws-ecr: circleci/aws-ecr@7.2.0
+  continuation: circleci/continuation@0.2.0
+
+parameters:
+  is-setup:
+    type: boolean
+    default: true
+  version-str:
+    type: string
+    default: dev
+  context-docker:
+    type: string
+    default: aws
+  context-k8s:
+    type: string
+    default: aws
+  release-on:
+    type: string
+    default: main
+
+jobs:
+  # セットアップ用のジョブ - dynamic config のメイン ワークフローの直前に実行しパラメータをダイナミックに決定
+  setup:
+    executor: continuation/default
+    steps:
+      - checkout
+      - run:
+          name: バージョン名を決定
+          command: |
+            # バージョン名には CircleCI のビルド番号とコミット ハッシュを入れておくとデバッグに便利
+            echo 'export VERSION_STR="${CIRCLE_BUILD_NUM}-${CIRCLE_SHA1:0:7}"' | tee -a $BASH_ENV
+      - run:
+          name: 使用する context を決定
+          command: |
+            # 任意の方法で context を決定する
+            # ここでは簡単のため常に `aws` を使用
+            echo 'export CONTEXT_DOCKER="aws"' | tee -a $BASH_ENV
+            echo 'export CONTEXT_K8S="aws"' | tee -a $BASH_ENV
+      - run:
+          name: パイプライン パラメータを JSON 化
+          command: |
+            # 上記ステップで設定した環境変数は $BASH_ENV にあるファイルが Bash により自動的に読み込まれることで利用可能となる
+            # https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html や https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html も参照
+            jq -n '{
+              "is-setup": false,
+              "version-str": $ENV.VERSION_STR,
+              "context-docker": $ENV.CONTEXT_DOCKER,
+              "context-k8s": $ENV.CONTEXT_K8S
+            }' | tee /tmp/continue-parameters.json
+      # メインのワークフローを呼び出す
+      - continuation/continue:
+          configuration_path: .circleci/config.yml
+          parameters: /tmp/continue-parameters.json
+
+  # 最終的なコンテナ イメージに搭載するファイルを用意
+  build-code:
+    docker:
+      - image: debian:bullseye-slim
+    steps:
+      - checkout
+      - run:
+          name: ビルドを実行
+          command: ./gen-version.sh "<< pipeline.parameters.version-str >>" # ビルドをどこでも同じように実行できるようビルド スクリプトを用意しておくと便利
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  # `helm upgrade` により直前のビルドで作成されたコンテナ イメージ
+  deploy:
+    executor: aws-cli/default
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/install
+      - run:
+          name: kubectl をインストール
+          working_directory: tmp
+          command: |
+            curl -fsSJLO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            echo "$(curl -fsSJL "https://dl.k8s.io/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl.sha256")" kubectl | sha256sum --check
+            sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      - run: aws eks update-kubeconfig --name makoto-server3
+      - run:
+          name: Helm をインストール
+          working_directory: tmp
+          command: |
+            curl -sSJL https://get.helm.sh/helm-v3.7.1-linux-amd64.tar.gz | tar -xz
+            sudo install -o root -g root -m 0755 linux-amd64/helm /usr/local/bin/helm
+      - run:
+          name: Helm チャートをデプロイ
+          working_directory: charts
+          command: |
+            if [ $(helm list -q -n "${K8S_NS}" | wc -l) -eq 0 ]
+            then
+              helm install -n "${K8S_NS}" --create-namespace --set images.name.nginx.tag="<< pipeline.parameters.version-str >>" "${HELM_APP_NAME}" .
+            else
+              helm upgrade -n "${K8S_NS}" --set images.name.nginx.tag="<< pipeline.parameters.version-str >>" "${HELM_APP_NAME}" .
+            fi
+      - run:
+          name: Route 53 を更新し svc (type=LoadBalancer) への ALIAS を設定
+          command: |
+            # LB のホスト名を取得
+            SVC_HOSTNAME="$(kubectl get svc "${HELM_APP_NAME}" -n "${K8S_NS}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+            while [ "${SVC_HOSTNAME}" == "" ]
+            do
+              sleep 1
+              SVC_HOSTNAME="$(kubectl get svc "${HELM_APP_NAME}" -n "${K8S_NS}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+            done
+            # ホスト名から LB 名を推定
+            SVC_LB_NAME="$(echo $SVC_HOSTNAME | awk -F'-' '{ print $1 }')"
+            # LB 名からゾーン ID を特定
+            SVC_LB_ZONE_ID="$(aws elb describe-load-balancers --region ap-northeast-1 --load-balancer-names $SVC_LB_NAME | jq -r '.LoadBalancerDescriptions[0].CanonicalHostedZoneNameID')"
+
+            # Route 53 の RRset を更新
+            aws route53 change-resource-record-sets --hosted-zone-id "${R53_ZONE_ID}" --change-batch '{
+              "Changes": [
+                {
+                  "Action": "UPSERT",
+                  "ResourceRecordSet": {
+                    "Name": "'"${R53_RR_NAME}"'",
+                    "Type": "A",
+                    "AliasTarget": {
+                      "HostedZoneId": "'"${SVC_LB_ZONE_ID}"'",
+                      "DNSName": "'"${SVC_HOSTNAME}"'",
+                      "EvaluateTargetHealth": false
+                    }
+                  }
+                }
+              ]
+            }'
+
+workflows:
+  # セットアップ ワークフロー
+  # 詳細は https://circleci.com/docs/ja/2.0/dynamic-config/ も参照
+  setup:
+    when: << pipeline.parameters.is-setup >>
+    jobs:
+      - setup
+
+  # メインのワークフロー
+  main:
+    when:
+      not: << pipeline.parameters.is-setup >>
+    jobs:
+      - build-code
+      # 理想的にはここでコードのユニット テスト・静的解析が入る
+      # 今回は時間節約のため省略
+      - aws-ecr/build-and-push-image:
+          name: build-docker-image
+          attach-workspace: true
+          repo: makoto-my-nginx
+          tag: << pipeline.parameters.version-str >>
+          requires:
+            - build-code
+          context:
+            - << pipeline.parameters.context-docker >> # AWS_ECR_ACCOUNT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+      # 理想的にはここにコンテナ イメージ ビルド後にイメージの smoke text や E2E テストが入る
+      # 今回は時間節約のため省略
+      - deploy:
+          requires:
+            - build-docker-image
+          context:
+            - << pipeline.parameters.context-k8s >> # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, HELM_APP_NAME, K8S_NS, R53_ZONE_ID, R53_RR_NAME
+          filters:
+            branches:
+              only: << pipeline.parameters.release-on >>
